@@ -249,6 +249,14 @@ function saveCustomerData(payload) {
     data.rawCalculatorData ? JSON.stringify(data.rawCalculatorData) : "" // עמודה 29 (חדשה): תוצאות גולמיות מהמחשבון (IRR/NPV/הנחות-יסוד), לשימוש עמוד ההדפסה
   ].map(val => val === null || val === undefined ? "" : String(val));
 
+  // תוקן (D1): כשהבקשה אינה כוללת rawCalculatorData (למשל שמירה מ-Index אחרי בחירת לקוח קיים,
+  // שם lastCalculatorRawData מאופס) משמרים את הערך הקיים בעמודה 29, ולא דורסים אותו ב-"".
+  // אחרת כל שמירה מ-Index הייתה מוחקת את תוצאות שלב 3 שנשמרו ב-updateCalculatorResults.
+  if (rowIndex > 0 && !data.rawCalculatorData) {
+    const existingRaw = rows[rowIndex - 1][28];
+    if (existingRaw !== undefined && existingRaw !== null && existingRaw !== "") rowData[28] = String(existingRaw);
+  }
+
   if (rowIndex > 0) {
     sheet.getRange(rowIndex, 1, 1, 29).setValues([rowData]);
     return "הנתונים עודכנו בהצלחה!";
@@ -384,14 +392,14 @@ function generateConsumptionExcelReport(payloadJson) {
   const defaultSheet = tempSS.getSheets()[0];
 
   try {
-    _buildMonsterSheet(tempSS, data.monsterTable, defaultSheet);
+    const monsterInfo = _buildMonsterSheet(tempSS, data.monsterTable);
     _buildGradientDataSheet(tempSS, 'דו"ח שעתי',
       data.hasProduction ? ['תאריך ושעה', 'יום בשבוע', 'צריכה בפועל (kwh)', 'ייצור (kwh)'] : ['תאריך ושעה', 'יום בשבוע', 'צריכה בפועל (kwh)'],
-      data.hourlyRows, data.hasProduction ? [2, 3] : [2]);
+      data.hourlyRows, data.hasProduction ? [2, 3] : [2], [0]);
     _buildGradientDataSheet(tempSS, 'דו"ח יומי מרוכז',
       data.hasProduction ? ['תאריך', 'יום בשבוע', 'סה"כ (kwh)', 'שפל', 'פסגה', 'ייצור (kwh)'] : ['תאריך', 'יום בשבוע', 'סה"כ (kwh)', 'שפל', 'פסגה'],
-      data.dailyRows, data.hasProduction ? [2, 3, 4, 5] : [2, 3, 4]);
-    _buildGradientDataSheet(tempSS, 'ימי פסגה בלבד', ['תאריך', 'יום בשבוע', 'צריכה (kwh)', 'עלות (₪)'], data.peakDays, [2, 3]);
+      data.dailyRows, data.hasProduction ? [2, 3, 4, 5] : [2, 3, 4], [0]);
+    _buildGradientDataSheet(tempSS, 'ימי פסגה בלבד', ['תאריך', 'יום בשבוע', 'צריכה (kwh)', 'עלות (₪)'], data.peakDays, [2, 3], [0]);
     _buildStatsSheet(tempSS, data.stats);
     _buildSourcesSheet(tempSS, data.sources, data.propertyType, data.propertyTypeLabel, data.shabbat);
     _buildTariffStructureSheet(tempSS, data.tariffStructure);
@@ -402,7 +410,10 @@ function generateConsumptionExcelReport(payloadJson) {
     const url = 'https://docs.google.com/spreadsheets/d/' + tempSS.getId() + '/export?format=xlsx';
     const response = UrlFetchApp.fetch(url, { headers: { Authorization: 'Bearer ' + token } });
     const base64 = Utilities.base64Encode(response.getBlob().getBytes());
-    return { ok: true, base64, filename: 'דוחות_צריכה_חחי_' + (data.clientName || 'לקוח_כללי') + '.xlsx' };
+    const warning = monsterInfo && monsterInfo.skippedMerges > 0
+      ? 'הקובץ נוצר, אך מיזוג התאים בגיליון "פירוט שנתי מלא" חלקי (' + monsterInfo.skippedMerges + ' קבוצות לא מוזגו) בגלל מגבלת זמן. להפעלת מיזוג מלא ומהיר: בעורך Apps Script, Services, הוספת Google Sheets API.'
+      : null;
+    return { ok: true, base64, filename: 'דוחות_צריכה_חחי_' + (data.clientName || 'לקוח_כללי') + '.xlsx', warning };
   } finally {
     DriveApp.getFileById(tempSS.getId()).setTrashed(true);
   }
@@ -425,9 +436,12 @@ function _applyRedYellowGradient(sheet, range) {
 
 // גיליון גנרי עם כותרת מעוצבת, טבלה עם מסנן (Filter), גבולות, וגרדיאנט צהוב-אדום
 // על העמודות המספריות שצוינו (gradientColIdxs, אינדקס 0 מבוסס, כולל הכותרת בעמודה 0).
-function _buildGradientDataSheet(ss, name, headers, rows, gradientColIdxs) {
+function _buildGradientDataSheet(ss, name, headers, rows, gradientColIdxs, textColIdxs) {
   const sheet = ss.insertSheet(name);
   if (!rows || !rows.length) { sheet.getRange(1, 1).setValue('אין נתונים'); return sheet; }
+  _ensureGrid(sheet, rows.length + 1, headers.length);
+  // עמודות תאריך כטקסט: אחרת Sheets מפרש 'DD/MM/YYYY' לפי הגדרות האזור של החשבון (סיכון להיפוך יום/חודש)
+  (textColIdxs || []).forEach(idx => sheet.getRange(2, idx + 1, rows.length, 1).setNumberFormat('@'));
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
   sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
   _styleHeaderRow(sheet.getRange(1, 1, 1, headers.length));
@@ -496,91 +510,147 @@ function _buildTariffStructureSheet(ss, tariffStructure) {
 
 // גיליון "פירוט שנתי מלא" - הטבלה ההיררכית עם מיזוגי תאים (שנה/עונה/יום/יום עברי),
 // בדיוק לפי המבנה שהיה קיים בעבר (14 עמודות + ייצור אם קיים), עכשיו מייצג נתוני עבר.
-function _buildMonsterSheet(ss, mt, existingSheet) {
-  if (!mt) return;
-  const sheet = existingSheet ? existingSheet.setName('פירוט שנתי מלא') : ss.insertSheet('פירוט שנתי מלא');
+// גיליון "פירוט שנתי מלא" - הטבלה ההיררכית עם מיזוגי תאים (שנה/עונה/יום/יום עברי), לפי המבנה של דוח הייחוס.
+// תוקן (D10): כל השורות נבנות בזיכרון ונכתבות בקריאה אחת (setValues + setBackgrounds); המיזוגים נשלחים בקבוצות.
+// קודם: 3 קריאות שירות לכל שורת שעה (~26,000 לשנה) - חריגה סבירה מ-6 דקות הריצה של Apps Script.
+// תוקן (D17): תמיד גיליון חדש. קודם נעשה שימוש חוזר בגיליון ברירת המחדל, ואז generateConsumptionExcelReport מחק אותו.
+function _buildMonsterSheet(ss, mt) {
+  if (!mt) return { sheet: null, skippedMerges: 0 };
+  const sheet = ss.insertSheet('פירוט שנתי מלא');
   const hasProduction = !!mt.hasProduction;
   const headers = ['שנה', 'צריכה שנתית (קוט"ש)', 'תשלום שנתי (₪)', 'עונה', 'צריכת עונה (קוט"ש)', 'תשלום עונתי (₪)',
     'תאריך', 'יום בשבוע', 'צריכה יומית (קוט"ש)', 'תשלום יומי (₪)', 'תאריך עברי', 'צריכת יום עברי (קוט"ש)', 'תשלום יום עברי (₪)',
     'שעה', 'צריכה שעתית (קוט"ש)', 'תשלום שעתי (₪)'];
   if (hasProduction) headers.push('ייצור שעתי (קוט"ש)');
-  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-  _styleHeaderRow(sheet.getRange(1, 1, 1, headers.length));
+  const ncols = headers.length;
 
-  let row = 2;
-  const yearStartRow = row;
+  // 1) בניית כל השורות בזיכרון. שום קריאת שירות בתוך הלולאות.
+  const rows = [], isOffpeak = [], merges = [];
   mt.seasons.forEach(season => {
-    const seasonStartRow = row;
+    const seasonStart = rows.length;
     season.days.forEach(day => {
-      const dayStartRow = row;
-      // קיבוץ תאריך עברי בתוך היום (עשוי להיות שונה מגבולות היום הגרגוריאני, ר' getZmanInfo בצד לקוח)
+      const dayStart = rows.length;
       let hIdx = 0;
       while (hIdx < day.hours.length) {
         const hebLabel = day.hours[hIdx].hebrewDate;
-        const hebStartRow = row;
+        const hebStart = rows.length;
         while (hIdx < day.hours.length && day.hours[hIdx].hebrewDate === hebLabel) {
           const h = day.hours[hIdx];
-          const rowData = [null, null, null, null, null, null, null, null, null, null, null, null, null, h.hourLabel, h.kwh, h.payment];
-          if (hasProduction) rowData.push(h.productionKwh != null ? h.productionKwh : '');
-          sheet.getRange(row, 1, 1, rowData.length).setValues([rowData]);
-          const hourCell = sheet.getRange(row, 14);
-          const isOffpeak = h.tariffType === 'שפל';
-          hourCell.setBackground(isOffpeak ? '#CCFFCC' : '#FFCCCC');
-          sheet.getRange(row, 15, 1, 2).setBackground(isOffpeak ? '#CCFFCC' : '#FFCCCC');
-          row++; hIdx++;
+          const r = new Array(ncols).fill('');
+          r[13] = h.hourLabel; r[14] = h.kwh; r[15] = h.payment;
+          if (hasProduction) r[16] = h.productionKwh != null ? h.productionKwh : '';
+          rows.push(r);
+          isOffpeak.push(h.tariffType === 'שפל');
+          hIdx++;
         }
-        if (row - 1 >= hebStartRow) {
-          sheet.getRange(hebStartRow, 11).setValue(hebLabel);
-          if (row - 1 > hebStartRow) sheet.getRange(hebStartRow, 11, row - hebStartRow, 1).merge();
-          const hebCons = day.hebrewGroups && day.hebrewGroups[hebLabel];
-          if (hebCons) {
-            sheet.getRange(hebStartRow, 12).setValue(_fmtTariffSplit(hebCons.kwh));
-            sheet.getRange(hebStartRow, 13).setValue(_fmtTariffSplit(hebCons.payment));
-            if (row - 1 > hebStartRow) { sheet.getRange(hebStartRow, 12, row - hebStartRow, 1).merge(); sheet.getRange(hebStartRow, 13, row - hebStartRow, 1).merge(); }
-          }
-        }
+        const grp = day.hebrewGroups && day.hebrewGroups[hebLabel];
+        const first = rows[hebStart];
+        first[10] = hebLabel;
+        if (grp) { first[11] = _fmtTariffSplit(grp.kwh); first[12] = _fmtTariffSplit(grp.payment); }
+        const n = rows.length - hebStart;
+        if (n > 1) merges.push({ row: hebStart + 2, col: 11, numRows: n, numCols: 3 });
       }
-      sheet.getRange(dayStartRow, 7).setValue(day.date);
-      sheet.getRange(dayStartRow, 8).setValue(day.dayOfWeek);
-      sheet.getRange(dayStartRow, 9).setValue(_fmtTariffSplit(day.kwh));
-      sheet.getRange(dayStartRow, 10).setValue(_fmtTariffSplit(day.payment));
-      if (row - 1 > dayStartRow) {
-        sheet.getRange(dayStartRow, 7, row - dayStartRow, 1).merge();
-        sheet.getRange(dayStartRow, 8, row - dayStartRow, 1).merge();
-        sheet.getRange(dayStartRow, 9, row - dayStartRow, 1).merge();
-        sheet.getRange(dayStartRow, 10, row - dayStartRow, 1).merge();
-      }
+      const d0 = rows[dayStart];
+      d0[6] = day.date; d0[7] = day.dayOfWeek; d0[8] = _fmtTariffSplit(day.kwh); d0[9] = _fmtTariffSplit(day.payment);
+      const nd = rows.length - dayStart;
+      if (nd > 1) merges.push({ row: dayStart + 2, col: 7, numRows: nd, numCols: 4 });
     });
-    sheet.getRange(seasonStartRow, 4).setValue(season.name);
-    sheet.getRange(seasonStartRow, 5).setValue(_fmtTariffSplit(season.kwh));
-    sheet.getRange(seasonStartRow, 6).setValue(_fmtTariffSplit(season.payment));
-    if (row - 1 > seasonStartRow) {
-      sheet.getRange(seasonStartRow, 4, row - seasonStartRow, 1).merge();
-      sheet.getRange(seasonStartRow, 5, row - seasonStartRow, 1).merge();
-      sheet.getRange(seasonStartRow, 6, row - seasonStartRow, 1).merge();
-    }
+    const s0 = rows[seasonStart];
+    s0[3] = season.name; s0[4] = _fmtTariffSplit(season.kwh); s0[5] = _fmtTariffSplit(season.payment);
+    const ns = rows.length - seasonStart;
+    if (ns > 1) merges.push({ row: seasonStart + 2, col: 4, numRows: ns, numCols: 3 });
   });
-  sheet.getRange(yearStartRow, 1).setValue(mt.yearLabel);
-  sheet.getRange(yearStartRow, 2).setValue(_fmtTariffSplit(mt.annualCons));
-  sheet.getRange(yearStartRow, 3).setValue(_fmtTariffSplit(mt.annualPay));
-  if (row - 1 > yearStartRow) {
-    sheet.getRange(yearStartRow, 1, row - yearStartRow, 1).merge();
-    sheet.getRange(yearStartRow, 2, row - yearStartRow, 1).merge();
-    sheet.getRange(yearStartRow, 3, row - yearStartRow, 1).merge();
+  if (rows.length) {
+    rows[0][0] = mt.yearLabel; rows[0][1] = _fmtTariffSplit(mt.annualCons); rows[0][2] = _fmtTariffSplit(mt.annualPay);
+    if (rows.length > 1) merges.push({ row: 2, col: 1, numRows: rows.length, numCols: 3 });
   }
-  sheet.getRange(1, 1, row - 1, headers.length).setBorder(true, true, true, true, true, true, '#dddddd', SpreadsheetApp.BorderStyle.SOLID);
+
+  // 2) כתיבה מקובצת
+  _ensureGrid(sheet, rows.length + 1, ncols);
+  sheet.getRange(1, 1, 1, ncols).setValues([headers]);
+  _styleHeaderRow(sheet.getRange(1, 1, 1, ncols));
+  if (!rows.length) return { sheet: sheet, skippedMerges: 0 };
+  sheet.getRange(2, 7, rows.length, 1).setNumberFormat('@');               // תאריך (DD/MM/YYYY) כטקסט
+  sheet.getRange(2, 1, rows.length, ncols).setValues(rows);
+  const bgCols = ncols - 13;                                              // עמודות 14.. : שעה, צריכה, תשלום, [ייצור]
+  sheet.getRange(2, 14, rows.length, bgCols).setBackgrounds(isOffpeak.map(off => new Array(bgCols).fill(off ? '#CCFFCC' : '#FFCCCC')));
+  sheet.getRange(2, 1, rows.length, 13).setVerticalAlignment('middle').setWrap(true);
+  const skippedMerges = _applyMerges(sheet, merges, Date.now() + 150000);
+  if (skippedMerges > 0) sheet.getRange(1, 1).setNote('מיזוג תאים חלקי: חריגה מתקציב הזמן. ' + skippedMerges + ' קבוצות לא מוזגו. להפעלת מיזוג מלא ומהיר: Services > Google Sheets API.');
+  sheet.getRange(1, 1, rows.length + 1, ncols).setBorder(true, true, true, true, true, true, '#dddddd', SpreadsheetApp.BorderStyle.SOLID);
   sheet.setFrozenRows(1);
-  sheet.setFrozenColumns(0);
+  return { sheet: sheet, skippedMerges: skippedMerges };
 }
 
 // מפרק אובייקט {offpeak, peak} לטקסט תצוגה "שפל: X\nפסגה: Y" (בדיוק כמו בדוח ההיסטורי)
+// מבטיח שהגיליון גדול מספיק לכתיבה (גיליון חדש מגיע בגודל ברירת מחדל 1000x26; כתיבה מעבר לכך עלולה להיכשל).
+function _ensureGrid(sheet, rows, cols) {
+  const mr = sheet.getMaxRows();
+  if (mr < rows) sheet.insertRowsAfter(mr, rows - mr);
+  const mc = sheet.getMaxColumns();
+  if (mc < cols) sheet.insertColumnsAfter(mc, cols - mc);
+}
+
+// מיזוגים. מסלול מהיר: Advanced Sheets Service (Services > Google Sheets API) - בקשת batchUpdate אחת
+// לכל 400 מיזוגים במקום קריאת שירות לכל מיזוג. אם השירות לא הופעל בפרויקט: Range.mergeVertically()
+// לכל קבוצה (ממזג כל עמודה בטווח בנפרד) - איטי יותר אך תקין.
+function _applyMerges(sheet, merges, deadlineMs) {
+  if (!merges.length) return 0;
+  if (typeof Sheets !== 'undefined' && Sheets.Spreadsheets && Sheets.Spreadsheets.batchUpdate) {
+    const ssId = sheet.getParent().getId();
+    const sheetId = sheet.getSheetId();
+    for (let i = 0; i < merges.length; i += 400) {
+      const requests = merges.slice(i, i + 400).map(m => ({
+        mergeCells: {
+          range: { sheetId: sheetId, startRowIndex: m.row - 1, endRowIndex: m.row - 1 + m.numRows,
+                   startColumnIndex: m.col - 1, endColumnIndex: m.col - 1 + m.numCols },
+          mergeType: 'MERGE_COLUMNS'
+        }
+      }));
+      Sheets.Spreadsheets.batchUpdate({ requests: requests }, ssId);
+    }
+    return 0;
+  }
+  // מסלול איטי: אם עבר תקציב הזמן, מפסיקים למזג (הקובץ עדיין נוצר, בלי המיזוגים הנותרים) במקום לחצות את 6 הדקות של Apps Script.
+  for (let i = 0; i < merges.length; i++) {
+    if (deadlineMs && Date.now() > deadlineMs) return merges.length - i;
+    const m = merges[i];
+    sheet.getRange(m.row, m.col, m.numRows, m.numCols).mergeVertically();
+  }
+  return 0;
+}
+
+// עיצוב מספר ידני (תוקן D11: toLocaleString('he-IL', {...}) לא אומת בסביבת V8 של Apps Script): עד 2 ספרות
+// אחרי הנקודה, בלי אפסים עודפים, עם פסיק לאלפים.
+function _fmtNum2(n) {
+  const r = Math.round(Number(n) * 100) / 100;
+  let t = r.toFixed(2);
+  t = t.replace(/0+$/, '').replace(/\.$/, '');
+  const parts = t.split('.');
+  parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return parts.join('.');
+}
+
+// מפרק אובייקט {offpeak, peak} לטקסט תצוגה "שפל:\nX\nפסגה:\nY" (בדיוק כמו בדוח ההיסטורי)
 function _fmtTariffSplit(obj) {
   if (obj == null) return '';
   if (typeof obj === 'number') return obj;
   const parts = [];
-  if (obj.offpeak != null) parts.push('שפל:\n' + Number(obj.offpeak).toLocaleString('he-IL', { maximumFractionDigits: 2 }));
-  if (obj.peak != null) parts.push('פסגה:\n' + Number(obj.peak).toLocaleString('he-IL', { maximumFractionDigits: 2 }));
+  if (obj.offpeak != null) parts.push('שפל:\n' + _fmtNum2(obj.offpeak));
+  if (obj.peak != null) parts.push('פסגה:\n' + _fmtNum2(obj.peak));
   return parts.join('\n');
+}
+
+// ניקוי קבצי ייצוא זמניים שנשארו (למשל כשהריצה נקטעה בחריגת זמן לפני ה-finally). להריץ ידנית או מ-Trigger שעתי.
+function cleanupTempExports() {
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  const it = DriveApp.searchFiles("title contains '_temp_export_' and trashed = false");
+  let n = 0;
+  while (it.hasNext()) {
+    const f = it.next();
+    if (f.getDateCreated().getTime() < cutoff) { f.setTrashed(true); n++; }
+  }
+  return n;
 }
 
 /**
